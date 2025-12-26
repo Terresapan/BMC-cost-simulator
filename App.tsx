@@ -8,7 +8,10 @@ import {
     SEARCH_FREE_TIER_DAILY,
     STORAGE_REGISTRY_COST,
     STORAGE_DB_COST,
-    NETWORKING_COST
+    NETWORKING_COST,
+    BACKGROUND_LLM_CALLS_PER_TRACE,
+    BACKGROUND_TOKENS_RATIO,
+    EVAL_TOKENS_PER_RUN
 } from './constants';
 import { CalculationStats, SensitivityPoint, PieDataPoint } from './types';
 import { Zap, Users, Calendar, Cpu, Search, Database, Server, Activity, Brain, Layers } from './components/Icons';
@@ -18,45 +21,58 @@ import { CostPieChart, SensitivityChart } from './components/CostCharts';
 import { BreakdownBarRow } from './components/BreakdownList';
 
 const App: React.FC = () => {
-    // --- State: Business Defaults ---
-    const [users, setUsers] = useState<number>(100);
-    const [tracesPerDay, setTracesPerDay] = useState<number>(50);
-    const [daysPerMonth, setDaysPerMonth] = useState<number>(10);
+    // --- State: Business Defaults (Growth scenario ~$2K/month target) ---
+    const [users, setUsers] = useState<number>(2000);
+    const [tracesPerDay, setTracesPerDay] = useState<number>(30);
+    const [daysPerMonth, setDaysPerMonth] = useState<number>(5);
     
     // --- State: Tech Defaults ---
-    const [selectedModel, setSelectedModel] = useState<string>("gemini-2.5-flash-lite");
-    const [inputPct, setInputPct] = useState<number>(0.70);
+    const [selectedModel, setSelectedModel] = useState<string>("gemini-3-flash");
+    const [inputPct, setInputPct] = useState<number>(0.50);
     const [tokensPerTrace, setTokensPerTrace] = useState<number>(2500);
     const [wallTime, setWallTime] = useState<number>(5.0);
     const [vcpu, setVcpu] = useState<number>(1.0);
     const [mem, setMem] = useState<number>(1.0);
     const [embedTokens, setEmbedTokens] = useState<number>(0);
-    const [searchesPerUserDay, setSearchesPerUserDay] = useState<number>(0);
+    const [searchesPerUserDay, setSearchesPerUserDay] = useState<number>(1);
 
-    // --- State: Infrastructure Defaults ---
+    // --- State: Proactive Agent Architecture ---
+    const [backgroundCalls, setBackgroundCalls] = useState<number>(BACKGROUND_LLM_CALLS_PER_TRACE);
+    
+    // --- State: Evaluation (LLM-as-a-Judge) ---
+    const [enableEval, setEnableEval] = useState<boolean>(true);
+    const [evalSampleRate, setEvalSampleRate] = useState<number>(0.2); // 10% of traces
+
     const [registryStorage, setRegistryStorage] = useState<number>(0.5); // GB
-    const [dbStorage, setDbStorage] = useState<number>(0.5); // GB
-    const [egress, setEgress] = useState<number>(5.0); // GB
+    const [dbStorage, setDbStorage] = useState<number>(5.0); // GB - 2.5KB per user × 2000 users + growth
+    const [egress, setEgress] = useState<number>(15.0); // GB - responses + PDF exports
 
     // --- Logic: Calculation ---
     const calculateStats = useCallback((): CalculationStats => {
         const tracesPerMonth = users * tracesPerDay * daysPerMonth;
         
-        // Tokens
+        // Tokens for main conversation
         const inputTokens = tokensPerTrace * inputPct;
         const outputTokens = tokensPerTrace * (1 - inputPct);
         
         const totalInput = inputTokens * tracesPerMonth;
         const totalOutput = outputTokens * tracesPerMonth;
         
-        // 1. Model Cost
+        // 1. Model Cost (Main Conversation)
         const mp = MODEL_PRICING[selectedModel];
-        const modelCost = (totalInput / 1e6) * mp.input + (totalOutput / 1e6) * mp.output;
+        const mainModelCost = (totalInput / 1e6) * mp.input + (totalOutput / 1e6) * mp.output;
         
-        // 2. Embedding Cost
+        // 2. Proactive Agent Cost (Memory Extraction + Proactive Suggestion)
+        const backgroundTokensPerTrace = tokensPerTrace * BACKGROUND_TOKENS_RATIO;
+        const totalBackgroundTokens = backgroundTokensPerTrace * backgroundCalls * tracesPerMonth;
+        const proactiveCost = (totalBackgroundTokens / 1e6) * (mp.input + mp.output) / 2; // Avg of input/output
+        
+        const modelCost = mainModelCost + proactiveCost;
+        
+        // 3. Embedding Cost
         const embeddingCost = (embedTokens / 1e6) * EMBED_PRICE;
         
-        // 3. Google Search Grounding Cost
+        // 4. Google Search Grounding Cost
         const isFlash = selectedModel.includes("flash"); 
         const dailyFreeLimit = isFlash ? SEARCH_FREE_TIER_DAILY : 0;
         
@@ -66,25 +82,34 @@ const App: React.FC = () => {
         const dailySearchCost = (billableDailySearches / 1000) * SEARCH_PRICE_PER_1K;
         const monthlySearchCost = dailySearchCost * daysPerMonth;
         
-        // 4. Compute Cost (Cloud Run)
+        // 5. Compute Cost (Cloud Run)
         const computeSeconds = wallTime * tracesPerMonth;
         const computeCost = (computeSeconds * vcpu * VCPU_COST) + (computeSeconds * mem * MEM_COST);
 
-        // 5. Infrastructure Cost
+        // 6. Evaluation Cost (LLM-as-a-Judge)
+        const evalTraces = enableEval ? tracesPerMonth * evalSampleRate : 0;
+        const evalMp = MODEL_PRICING["gemini-2.5-flash"]; // Evaluation uses Flash model
+        const evalCost = enableEval 
+            ? (evalTraces * EVAL_TOKENS_PER_RUN / 1e6) * (evalMp.input + evalMp.output) / 2
+            : 0;
+
+        // 7. Infrastructure Cost
         const infraRegistry = registryStorage * STORAGE_REGISTRY_COST;
         const infraDb = dbStorage * STORAGE_DB_COST;
         const infraEgress = egress * NETWORKING_COST;
         
         const infraTotal = infraRegistry + infraDb + infraEgress;
         
-        const totalMonthly = modelCost + embeddingCost + monthlySearchCost + computeCost + infraTotal;
+        const totalMonthly = modelCost + embeddingCost + monthlySearchCost + computeCost + evalCost + infraTotal;
         
         return {
             tracesPerMonth,
             modelCost,
+            proactiveCost,
             embeddingCost,
             monthlySearchCost,
             computeCost,
+            evalCost,
             infraTotal,
             infraRegistry,
             infraDb,
@@ -93,7 +118,7 @@ const App: React.FC = () => {
             costPerUser: totalMonthly / (users || 1),
             costPer1kTraces: (totalMonthly / (tracesPerMonth || 1)) * 1000
         };
-    }, [users, tracesPerDay, daysPerMonth, selectedModel, inputPct, tokensPerTrace, wallTime, vcpu, mem, embedTokens, searchesPerUserDay, registryStorage, dbStorage, egress]);
+    }, [users, tracesPerDay, daysPerMonth, selectedModel, inputPct, tokensPerTrace, wallTime, vcpu, mem, embedTokens, searchesPerUserDay, backgroundCalls, enableEval, evalSampleRate, registryStorage, dbStorage, egress]);
 
     const stats = calculateStats();
 
@@ -106,7 +131,14 @@ const App: React.FC = () => {
             const inTok = tokensPerTrace * inputPct * traces;
             const outTok = tokensPerTrace * (1 - inputPct) * traces;
             const mp = MODEL_PRICING[selectedModel];
-            const mCost = (inTok / 1e6) * mp.input + (outTok / 1e6) * mp.output;
+            const mainModelCost = (inTok / 1e6) * mp.input + (outTok / 1e6) * mp.output;
+            
+            // Proactive Agent Cost (Memory Extraction + Proactive Suggestion)
+            const backgroundTokensPerTrace = tokensPerTrace * BACKGROUND_TOKENS_RATIO;
+            const totalBackgroundTokens = backgroundTokensPerTrace * backgroundCalls * traces;
+            const proactiveCostScaled = (totalBackgroundTokens / 1e6) * (mp.input + mp.output) / 2;
+            
+            const mCost = mainModelCost + proactiveCostScaled;
             
             // Assume embedding tokens scale linearly with users for simplicity in this view
             const scaledEmbed = (embedTokens / (users || 1)) * scaledUsers; 
@@ -121,6 +153,13 @@ const App: React.FC = () => {
             const cSec = wallTime * traces;
             const cCost = (cSec * vcpu * VCPU_COST) + (cSec * mem * MEM_COST);
             
+            // Evaluation Cost (LLM-as-a-Judge)
+            const evalTraces = enableEval ? traces * evalSampleRate : 0;
+            const evalMp = MODEL_PRICING["gemini-2.5-flash"];
+            const evalCostScaled = enableEval 
+                ? (evalTraces * EVAL_TOKENS_PER_RUN / 1e6) * (evalMp.input + evalMp.output) / 2
+                : 0;
+            
             const iReg = registryStorage * STORAGE_REGISTRY_COST;
             const scaledDbStorage = (dbStorage / (users || 1)) * scaledUsers;
             const iDb = scaledDbStorage * STORAGE_DB_COST;
@@ -133,17 +172,19 @@ const App: React.FC = () => {
 
             data.push({
                 users: scaledUsers,
-                cost: mCost + eCostScaled + sCost + cCost + iTotal
+                cost: mCost + eCostScaled + sCost + cCost + evalCostScaled + iTotal
             });
         }
         return data;
-    }, [users, tracesPerDay, daysPerMonth, tokensPerTrace, inputPct, selectedModel, embedTokens, searchesPerUserDay, wallTime, vcpu, mem, registryStorage, dbStorage, egress]); 
+    }, [users, tracesPerDay, daysPerMonth, tokensPerTrace, inputPct, selectedModel, embedTokens, searchesPerUserDay, wallTime, vcpu, mem, backgroundCalls, enableEval, evalSampleRate, registryStorage, dbStorage, egress]); 
 
     // Brand Palette: Fuchsia-500 (#d946ef) via Purple-500 (#a855f7) to Indigo-500 (#6366f1)
     const pieData: PieDataPoint[] = [
-        { name: 'LLM Model', value: stats.modelCost, color: '#d946ef' }, // Fuchsia
+        { name: 'LLM (Main)', value: stats.modelCost - stats.proactiveCost, color: '#d946ef' }, // Fuchsia
+        { name: 'LLM (Proactive)', value: stats.proactiveCost, color: '#f472b6' }, // Pink-400
         { name: 'Grounding', value: stats.monthlySearchCost, color: '#a855f7' }, // Purple
         { name: 'Cloud Run', value: stats.computeCost, color: '#6366f1' }, // Indigo
+        { name: 'Evaluation', value: stats.evalCost, color: '#22d3ee' }, // Cyan
         { name: 'Embeddings', value: stats.embeddingCost, color: '#ec4899' }, // Pink
         { name: 'Infra & Storage', value: stats.infraTotal, color: '#8b5cf6' } // Violet
     ].filter(d => d.value > 0);
@@ -267,6 +308,47 @@ const App: React.FC = () => {
                                 min={0.5} max={16} step={0.5} 
                             />
                          </div>
+                    </div>
+
+                    {/* Proactive Agent Architecture */}
+                    <div className="bg-slate-900 p-6 rounded-2xl shadow-lg shadow-black/20 border border-slate-800">
+                        <h2 className="text-xs font-bold uppercase text-slate-500 tracking-wider mb-6 flex items-center">
+                            <Brain size={16} className="mr-2 text-slate-600" /> Proactive Agent
+                        </h2>
+                        <p className="text-slate-400 text-xs mb-4">
+                            Each trace triggers background LLM calls for memory extraction and proactive suggestions.
+                        </p>
+                        <InputSlider 
+                            label="Background LLM Calls / Trace" 
+                            value={backgroundCalls} 
+                            onChange={setBackgroundCalls} 
+                            min={0} max={5} step={1} 
+                        />
+                    </div>
+
+                    {/* Evaluation (LLM-as-a-Judge) */}
+                    <div className="bg-slate-900 p-6 rounded-2xl shadow-lg shadow-black/20 border border-slate-800">
+                        <h2 className="text-xs font-bold uppercase text-slate-500 tracking-wider mb-6 flex items-center">
+                            <Activity size={16} className="mr-2 text-slate-600" /> Evaluation
+                        </h2>
+                        <div className="flex items-center justify-between mb-4">
+                            <span className="text-sm font-medium text-slate-400">Enable LLM-as-a-Judge</span>
+                            <button 
+                                onClick={() => setEnableEval(!enableEval)}
+                                className={`w-12 h-6 rounded-full transition-colors ${enableEval ? 'bg-fuchsia-500' : 'bg-slate-700'}`}
+                            >
+                                <span className={`block w-4 h-4 bg-white rounded-full transform transition-transform mx-1 ${enableEval ? 'translate-x-5' : 'translate-x-0'}`}></span>
+                            </button>
+                        </div>
+                        {enableEval && (
+                            <InputSlider 
+                                label="Sample Rate" 
+                                value={evalSampleRate} 
+                                onChange={setEvalSampleRate} 
+                                min={0.01} max={1} step={0.01} 
+                                unit="%"
+                            />
+                        )}
                     </div>
 
                     {/* Infrastructure Inputs */}
@@ -409,12 +491,20 @@ const App: React.FC = () => {
                                 color="#8b5cf6"
                                 bgClass="" colorClass="" 
                             />
+                            <BreakdownBarRow 
+                                label="LLM Evaluation" 
+                                value={stats.evalCost} 
+                                total={stats.totalMonthly}
+                                icon={Activity} 
+                                color="#22d3ee"
+                                bgClass="" colorClass="" 
+                            />
                          </div>
                     </div>
 
                      {/* Info Footer */}
                     <div className="text-center text-slate-500 text-xs py-4">
-                         BMC Town AI Cost Simulator • Estimates based on Gemini 2.5 Pricing & GCP Cloud Run Standard Tiers.
+                         BMC Town AI Cost Simulator • Estimates based on Gemini 3 Pricing & GCP Cloud Run Standard Tiers.
                     </div>
 
                 </div>

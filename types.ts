@@ -11,9 +11,11 @@ export interface PricingMap {
 export interface CalculationStats {
   tracesPerMonth: number;
   modelCost: number;
+  proactiveCost: number;
   embeddingCost: number;
   monthlySearchCost: number;
   computeCost: number;
+  evalCost: number;
   infraTotal: number;
   infraRegistry: number;
   infraDb: number;
