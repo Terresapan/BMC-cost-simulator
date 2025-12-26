@@ -1,0 +1,5 @@
+{
+  "name": "BMC Town AI Cost Simulator",
+  "description": "A sleek, interactive dashboard for estimating AI agent architecture costs using Gemini models, Google Search Grounding, and Cloud Infrastructure.",
+  "requestFramePermissions": []
+}
